@@ -1,0 +1,128 @@
+pipeline {
+    parameters{
+        booleanParam(name: 'SKIP_CODE_SCAN', defaultValue: false, description: 'skip code scan stage, which may lead to bad quality code added into this project')
+    }
+    environment {
+        SKIP_CODE_SCAN = "${params.SKIP_CODE_SCAN}"
+        SKIP_AUTOMATE_TEST = "${params.SKIP_AUTOMATE_TEST}"
+        ENVIRONMENT = "${params.ENVIRONMENT}"
+        SYSTEM_NAME = "${params.SYSTEM_NAME}"
+        SERVICE_NAME = "${params.SERVICE_NAME}"
+        VERSION = "${env.BUILD_NUMBER}"
+        IMAGE_NAME = "${SYSTEM_NAME}/${SYSTEM_NAME}-${SERVICE_NAME}"
+        REGISTRY_CREDENTIAL = "dx-patois-container-registry-cred"
+        NAMESPACE = "${SYSTEM_NAME}-${params.ENVIRONMENT}"
+        REGISTRY = "newpatoiscontainerregistry.azurecr.io"
+        GITLAB_CREDENTIAL = credentials("gitlab-token-credential")
+    }
+    agent any
+    stages {
+        
+        stage('code quality scan') {
+            when {
+                environment name: 'SKIP_CODE_SCAN', value: 'false'
+            }
+            steps {
+                step([$class: 'DescribeWithParamsBuilder', starter: 'true', separator: '', excludes: 'SYSTEM_NAME;SERVICE_NAME'])
+                script {
+                    def scannerHome = tool 'sonar-scanner';
+                    withSonarQubeEnv() {
+                        sh "${scannerHome}/bin/sonar-scanner " +
+                        "-Dsonar.qualitygate.wait " +
+                        "-Dsonar.projectKey=${SYSTEM_NAME}-${SERVICE_NAME} " +
+                        "-Dsonar.projectName=${SYSTEM_NAME}-${SERVICE_NAME} " +
+                        "-Dsonar.sourceEncoding=UTF-8 " +
+                        "-Dsonar.sources=. " +
+                        '-Dsonar.exclusions=".git/**, .vscode/**"'
+                }
+                    }
+                }
+            }
+        stage("Quality Gate") {
+            when {
+                environment name: 'SKIP_CODE_SCAN', value: 'false'
+                }
+            steps {
+                script {
+                    def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                    if (qg.status != 'OK') {
+                        echo "See report from URL: http://scancode.pt.co.th/dashboard?id=${SYSTEM_NAME}-${SERVICE_NAME}"
+                        currentBuild.result = "FAILURE"
+                        error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                    }
+                    echo "See report from URL: https://scancode.pt.co.th/dashboard?id=${SYSTEM_NAME}-${SERVICE_NAME}"
+                }
+            }
+        }
+
+        stage('Build application') {
+            agent {
+                docker {
+                   image "node:16.19"
+                   args '-u root'
+                   registryCredentialsId 'dockerhub-credential'
+                   reuseNode true
+               }
+            }
+            steps {
+                script {
+                    // nodejs(nodeJSInstallationName: 'NodeJS16') {
+                        sh """
+                        ls -al
+                        node -v
+                        npm install
+                        """
+                    // }
+                }
+            }
+        }
+        stage('Docker build and upload to registry') {
+            steps {
+                script {
+                    docker.withRegistry("http://" + "${REGISTRY}", "${REGISTRY_CREDENTIAL}") {
+                        a = docker.build("${REGISTRY}" + "/" + "${IMAGE_NAME}" + ":"+"${VERSION}", "-f Dockerfile .")
+                    }
+                    docker.withRegistry("http://" + "${REGISTRY}", "${REGISTRY_CREDENTIAL}") {
+                        a.push()
+                    }
+                }
+            }
+        }
+
+        stage('Tag') {
+            steps {
+            	script {
+                    withCredentials([string(credentialsId: 'gitlab-token-credential', variable: 'gitlab-token-credential')]) {
+                        sh("git config --global user.email 'piyachate.le@pt.co.th'")
+                        sh("git config --global user.name 'piyachate.le@pt.co.th'")
+                        sh("git remote set-url origin https://gitlab-ci-token:${env.GITLAB_CREDENTIAL}@scm.pt.co.th/dx/${env.SYSTEM_NAME}/${env.SYSTEM_NAME}-${env.SERVICE_NAME}/${env.SYSTEM_NAME}-${env.SERVICE_NAME}.git")
+                        sh("git tag -fa ${env.BUILD_NUMBER} -m 'build version ${env.BUILD_NUMBER}'")
+                        sh("git push -f origin ${env.BUILD_NUMBER}")
+                    }
+	            }
+            }
+        }
+
+        stage('Cleanup') {
+            when {
+                environment name: 'ENVIRONMENT', value: 'dev'
+            }
+            steps {
+                script {
+                    sh "docker rmi ${REGISTRY}" + "/" + "${IMAGE_NAME}" + ":"+"${VERSION}"
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+/*            
+            emailext body: "Jenkins Build ${currentBuild.currentResult}: Job ${env.JOB_NAME}", 
+                    subject: "${currentBuild.currentResult}: Job ${env.JOB_NAME} build ${env.BUILD_NUMBER}\n More info at: ${env.BUILD_URL}", 
+                    to: "settakit@sirisoft.co.th, narawit@sirisoft.co.th"
+                    */
+            cleanWs()
+        }
+    }
+}
